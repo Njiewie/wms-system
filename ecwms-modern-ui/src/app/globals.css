@@ -1,0 +1,236 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 221 83% 53%;
+    --primary-foreground: 355 20% 99%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 221 83% 53%;
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+    --radius: 0.75rem;
+
+    /* WMS Specific Colors */
+    --wms-primary: 221 83% 53%;
+    --wms-success: 142 76% 36%;
+    --wms-warning: 43 96% 56%;
+    --wms-danger: 0 84% 60%;
+    --wms-info: 199 89% 48%;
+    --wms-gray-50: 240 5% 96%;
+    --wms-gray-100: 240 5% 94%;
+    --wms-gray-900: 240 6% 10%;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 3.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 221 83% 53%;
+    --primary-foreground: 355 20% 99%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 221 83% 53%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+@layer components {
+  /* WMS Specific Component Styles */
+  .wms-card {
+    @apply bg-card text-card-foreground rounded-xl border shadow-sm hover:shadow-md transition-all duration-200;
+  }
+
+  .wms-stat-card {
+    @apply wms-card p-6 relative overflow-hidden;
+  }
+
+  .wms-stat-card::before {
+    @apply absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-500 to-blue-600;
+    content: '';
+  }
+
+  .wms-nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 hover:bg-accent hover:text-accent-foreground;
+  }
+
+  .wms-nav-item.active {
+    @apply bg-primary text-primary-foreground shadow-sm;
+  }
+
+  .wms-badge-status {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .wms-badge-hold {
+    @apply bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400;
+  }
+
+  .wms-badge-released {
+    @apply bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400;
+  }
+
+  .wms-badge-allocated {
+    @apply bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400;
+  }
+
+  .wms-badge-picked {
+    @apply bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400;
+  }
+
+  .wms-badge-shipped {
+    @apply bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300;
+  }
+
+  .wms-table-row {
+    @apply hover:bg-muted/50 cursor-pointer transition-colors;
+  }
+
+  .wms-table-row.selected {
+    @apply bg-primary/10 border-l-4 border-l-primary;
+  }
+
+  .wms-metric {
+    @apply text-2xl font-bold text-foreground;
+  }
+
+  .wms-metric-large {
+    @apply text-3xl font-bold text-foreground;
+  }
+
+  .wms-metric-label {
+    @apply text-sm text-muted-foreground;
+  }
+
+  .wms-section-header {
+    @apply text-lg font-semibold text-foreground mb-4;
+  }
+
+  .wms-page-header {
+    @apply border-b pb-6 mb-6;
+  }
+
+  .wms-action-bar {
+    @apply flex items-center justify-between gap-4 p-4 bg-muted/30 rounded-lg;
+  }
+
+  /* Animation utilities */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-in-out;
+  }
+
+  .animate-slide-up {
+    animation: slideUp 0.4s ease-out;
+  }
+
+  .animate-scale-in {
+    animation: scaleIn 0.2s ease-out;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Custom scrollbar */
+.wms-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.wms-scrollbar::-webkit-scrollbar-track {
+  background: hsl(var(--muted));
+  border-radius: 3px;
+}
+
+.wms-scrollbar::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 3px;
+}
+
+.wms-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground));
+}
+
+/* Loading skeleton styles */
+.wms-skeleton {
+  @apply animate-pulse bg-muted rounded;
+}
+
+/* Focus styles for accessibility */
+.wms-focus {
+  @apply focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2;
+}
