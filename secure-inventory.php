@@ -1,188 +1,398 @@
 <?php
+/**
+ * Secure Inventory Management System
+ * Comprehensive inventory listing with filtering, search, and secure operations
+ */
+
 require_once 'security-utils.php';
-require 'auth.php';
-require_login();
-include 'db_config.php';
+require_once 'db_config.php';
 
-// Set security headers
-setSecurityHeaders();
+$security = SecurityUtils::getInstance();
+$db = getDB();
 
-// Validate CSRF token for POST requests
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    try {
-        validate_csrf();
-    } catch (Exception $e) {
-        handleSecurityError('Invalid security token');
-    }
+// Check rate limiting and session
+if (!$security->checkRateLimit()) {
+    http_response_code(429);
+    $security->logActivity('RATE_LIMIT_EXCEEDED', ['page' => 'inventory'], 'WARNING');
+    die('Rate limit exceeded. Please try again later.');
 }
 
-// Secure pagination parameters
-$page = 1;
-$limit = 50;
-
-if (isset($_GET['page'])) {
-    try {
-        $page = WMSSecurity::validateInteger($_GET['page'], 1, 1000);
-    } catch (Exception $e) {
-        $page = 1;
-    }
+if (!$security->validateSession('operator')) {
+    $security->logActivity('UNAUTHORIZED_ACCESS_ATTEMPT', ['page' => 'inventory'], 'WARNING');
+    header('Location: auth.php');
+    exit();
 }
 
-if (isset($_GET['limit'])) {
-    try {
-        $limit = WMSSecurity::validateInteger($_GET['limit'], 10, 1000);
-        if (!in_array($limit, [10, 25, 50, 100, 250, 500, 1000])) {
-            $limit = 50;
-        }
-    } catch (Exception $e) {
-        $limit = 50;
+$csrfToken = $security->generateCSRFToken();
+$message = '';
+$messageType = '';
+
+// Handle AJAX requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    header('Content-Type: application/json');
+    
+    if (!$security->validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Invalid CSRF token']);
+        exit();
     }
+    
+    $action = $security->sanitizeInput($_POST['action']);
+    
+    switch ($action) {
+        case 'get_inventory_data':
+            try {
+                $filters = [
+                    'search' => $security->sanitizeInput($_POST['search'] ?? ''),
+                    'location' => $security->sanitizeInput($_POST['location'] ?? ''),
+                    'stock_level' => $security->sanitizeInput($_POST['stock_level'] ?? ''),
+                    'client' => $security->sanitizeInput($_POST['client'] ?? ''),
+                    'page' => max(1, (int) ($_POST['page'] ?? 1))
+                ];
+                
+                $result = getInventoryData($db, $filters);
+                echo json_encode(['success' => true, 'data' => $result]);
+            } catch (Exception $e) {
+                $security->logActivity('INVENTORY_DATA_ERROR', ['error' => $e->getMessage()], 'ERROR');
+                echo json_encode(['error' => 'Failed to load inventory data']);
+            }
+            break;
+            
+        case 'export_inventory':
+            try {
+                $format = $security->sanitizeInput($_POST['format'] ?? 'csv');
+                $filters = [
+                    'search' => $security->sanitizeInput($_POST['search'] ?? ''),
+                    'location' => $security->sanitizeInput($_POST['location'] ?? ''),
+                    'stock_level' => $security->sanitizeInput($_POST['stock_level'] ?? ''),
+                    'client' => $security->sanitizeInput($_POST['client'] ?? '')
+                ];
+                
+                $exportData = exportInventory($db, $security, $filters, $format);
+                echo json_encode(['success' => true, 'data' => $exportData]);
+            } catch (Exception $e) {
+                echo json_encode(['error' => 'Failed to export inventory']);
+            }
+            break;
+            
+        case 'bulk_action':
+            try {
+                $bulkAction = $security->sanitizeInput($_POST['bulk_action']);
+                $selectedItems = $_POST['selected_items'] ?? [];
+                
+                if (empty($selectedItems)) {
+                    echo json_encode(['error' => 'No items selected']);
+                    break;
+                }
+                
+                $result = handleBulkAction($db, $security, $bulkAction, $selectedItems);
+                echo json_encode($result);
+            } catch (Exception $e) {
+                echo json_encode(['error' => 'Bulk action failed']);
+            }
+            break;
+            
+        default:
+            http_response_code(400);
+            echo json_encode(['error' => 'Invalid action']);
+    }
+    exit();
 }
 
-$offset = ($page - 1) * $limit;
+// Get filter options
+$locations = getLocations($db);
+$clients = getClients($db);
 
-// Build secure WHERE conditions
-$where_conditions = [];
-$bind_types = '';
-$bind_params = [];
-
-// Define filterable fields with their types
-$filterable_fields = [
-    'tag_id' => 's',
-    'client_id' => 'i',
-    'sku_id' => 's',
-    'site_id' => 's',
-    'location_id' => 's',
-    'description' => 's',
-    'qty_on_hand' => 'i',
-    'qty_allocated' => 'i',
-    'batch_id' => 's',
-    'condition' => 's',
-    'lock_status' => 's',
-    'zone' => 's',
-    'pallet_config' => 's',
-    'receipt_id' => 's',
-    'line_id' => 's',
-    'pallet_id' => 's',
-    'container_id' => 's'
+// Get initial inventory data
+$filters = [
+    'search' => $security->sanitizeInput($_GET['search'] ?? ''),
+    'location' => $security->sanitizeInput($_GET['location'] ?? ''),
+    'stock_level' => $security->sanitizeInput($_GET['stock_level'] ?? ''),
+    'client' => $security->sanitizeInput($_GET['client'] ?? ''),
+    'page' => max(1, (int) ($_GET['page'] ?? 1))
 ];
 
-// Process filters securely
-foreach ($filterable_fields as $field => $type) {
-    if (!empty($_GET[$field])) {
-        try {
-            if ($type === 'i') {
-                $value = WMSSecurity::validateInteger($_GET[$field]);
-                $where_conditions[] = "`{$field}` = ?";
-            } elseif ($type === 's') {
-                $value = WMSSecurity::sanitizeString($_GET[$field], 100);
-                if ($field === 'description') {
-                    $where_conditions[] = "`{$field}` LIKE ?";
-                    $value = "%{$value}%";
-                } else {
-                    $where_conditions[] = "`{$field}` = ?";
-                }
-            }
-            $bind_types .= $type;
-            $bind_params[] = $value;
-        } catch (Exception $e) {
-            // Skip invalid filter values
-            continue;
+try {
+    $inventoryData = getInventoryData($db, $filters);
+    $inventory = $inventoryData['data'];
+    $pagination = $inventoryData['pagination'];
+    $summary = $inventoryData['summary'];
+} catch (Exception $e) {
+    $security->logActivity('INVENTORY_LOAD_ERROR', ['error' => $e->getMessage()], 'ERROR');
+    $inventory = [];
+    $pagination = ['current_page' => 1, 'total_pages' => 1, 'total' => 0];
+    $summary = ['total_items' => 0, 'total_quantity' => 0, 'low_stock_count' => 0];
+}
+
+$security->logActivity('INVENTORY_ACCESS', ['filters' => $filters]);
+
+/**
+ * Get inventory data with filters
+ */
+function getInventoryData($db, $filters) {
+    $whereClause = "i.deleted_at IS NULL";
+    $params = [];
+    
+    // Search filter
+    if (!empty($filters['search'])) {
+        $whereClause .= " AND (i.sku LIKE ? OR sm.description LIKE ? OR i.location LIKE ?)";
+        $searchTerm = "%{$filters['search']}%";
+        $params[] = $searchTerm;
+        $params[] = $searchTerm;
+        $params[] = $searchTerm;
+    }
+    
+    // Location filter
+    if (!empty($filters['location'])) {
+        $whereClause .= " AND i.location = ?";
+        $params[] = $filters['location'];
+    }
+    
+    // Client filter
+    if (!empty($filters['client'])) {
+        $whereClause .= " AND i.client = ?";
+        $params[] = $filters['client'];
+    }
+    
+    // Stock level filter
+    if (!empty($filters['stock_level'])) {
+        switch ($filters['stock_level']) {
+            case 'zero':
+                $whereClause .= " AND i.quantity = 0";
+                break;
+            case 'low':
+                $whereClause .= " AND i.quantity > 0 AND i.quantity <= COALESCE(sm.min_stock_level, 10)";
+                break;
+            case 'normal':
+                $whereClause .= " AND i.quantity > COALESCE(sm.min_stock_level, 10)";
+                break;
         }
     }
+    
+    // Get total count for pagination
+    $totalCount = $db->fetchValue(
+        "SELECT COUNT(*) FROM inventory i 
+         LEFT JOIN sku_master sm ON i.sku = sm.sku 
+         WHERE {$whereClause}",
+        $params
+    ) ?: 0;
+    
+    // Calculate pagination
+    $perPage = 50;
+    $totalPages = ceil($totalCount / $perPage);
+    $offset = ($filters['page'] - 1) * $perPage;
+    
+    // Get inventory data
+    $inventory = $db->fetchAll(
+        "SELECT i.id, i.sku, i.quantity, i.location, i.client, i.created_at, i.updated_at,
+                sm.description, sm.unit_cost, sm.min_stock_level, sm.max_stock_level,
+                CASE 
+                    WHEN i.quantity = 0 THEN 'zero'
+                    WHEN i.quantity <= COALESCE(sm.min_stock_level, 10) THEN 'low'
+                    ELSE 'normal'
+                END as stock_status
+         FROM inventory i 
+         LEFT JOIN sku_master sm ON i.sku = sm.sku 
+         WHERE {$whereClause}
+         ORDER BY i.updated_at DESC, i.sku ASC 
+         LIMIT {$perPage} OFFSET {$offset}",
+        $params
+    );
+    
+    // Get summary statistics
+    $summary = $db->fetchRow(
+        "SELECT 
+            COUNT(*) as total_items,
+            COALESCE(SUM(i.quantity), 0) as total_quantity,
+            COALESCE(SUM(CASE WHEN i.quantity <= COALESCE(sm.min_stock_level, 10) AND i.quantity > 0 THEN 1 ELSE 0 END), 0) as low_stock_count,
+            COALESCE(SUM(CASE WHEN i.quantity = 0 THEN 1 ELSE 0 END), 0) as zero_stock_count,
+            COALESCE(SUM(i.quantity * COALESCE(sm.unit_cost, 0)), 0) as total_value
+         FROM inventory i 
+         LEFT JOIN sku_master sm ON i.sku = sm.sku 
+         WHERE {$whereClause}",
+        $params
+    );
+    
+    return [
+        'data' => $inventory,
+        'pagination' => [
+            'current_page' => $filters['page'],
+            'total_pages' => $totalPages,
+            'total' => $totalCount,
+            'per_page' => $perPage,
+            'has_prev' => $filters['page'] > 1,
+            'has_next' => $filters['page'] < $totalPages
+        ],
+        'summary' => $summary
+    ];
 }
 
-// Handle date filters securely
-$date_fields = ['receipt_dstamp', 'move_dstamp', 'count_dstamp', 'last_updated'];
-foreach ($date_fields as $field) {
-    $filter_type = $_GET[$field . '_filter'] ?? '';
-    $from_date = $_GET[$field . '_from'] ?? '';
-    $to_date = $_GET[$field . '_to'] ?? '';
+/**
+ * Get available locations
+ */
+function getLocations($db) {
+    return $db->fetchAll(
+        "SELECT DISTINCT location FROM inventory 
+         WHERE location IS NOT NULL AND location != '' AND deleted_at IS NULL 
+         ORDER BY location"
+    );
+}
 
-    if (!empty($from_date) || !empty($to_date)) {
-        try {
-            switch ($filter_type) {
-                case 'between':
-                    if ($from_date && $to_date) {
-                        WMSSecurity::validateDate($from_date);
-                        WMSSecurity::validateDate($to_date);
-                        $where_conditions[] = "`{$field}` BETWEEN ? AND ?";
-                        $bind_types .= 'ss';
-                        $bind_params[] = $from_date;
-                        $bind_params[] = $to_date;
-                    }
-                    break;
-                case 'before':
-                    if ($to_date) {
-                        WMSSecurity::validateDate($to_date);
-                        $where_conditions[] = "`{$field}` < ?";
-                        $bind_types .= 's';
-                        $bind_params[] = $to_date;
-                    }
-                    break;
-                case 'after':
-                    if ($from_date) {
-                        WMSSecurity::validateDate($from_date);
-                        $where_conditions[] = "`{$field}` > ?";
-                        $bind_types .= 's';
-                        $bind_params[] = $from_date;
-                    }
-                    break;
-                case 'exclude':
-                    if ($from_date && $to_date) {
-                        WMSSecurity::validateDate($from_date);
-                        WMSSecurity::validateDate($to_date);
-                        $where_conditions[] = "(`{$field}` < ? OR `{$field}` > ?)";
-                        $bind_types .= 'ss';
-                        $bind_params[] = $from_date;
-                        $bind_params[] = $to_date;
-                    }
-                    break;
-            }
-        } catch (Exception $e) {
-            // Skip invalid date filters
-            continue;
+/**
+ * Get available clients
+ */
+function getClients($db) {
+    return $db->fetchAll(
+        "SELECT DISTINCT client FROM inventory 
+         WHERE client IS NOT NULL AND client != '' AND deleted_at IS NULL 
+         ORDER BY client"
+    );
+}
+
+/**
+ * Export inventory data
+ */
+function exportInventory($db, $security, $filters, $format) {
+    $whereClause = "i.deleted_at IS NULL";
+    $params = [];
+    
+    // Apply same filters as the main query
+    if (!empty($filters['search'])) {
+        $whereClause .= " AND (i.sku LIKE ? OR sm.description LIKE ? OR i.location LIKE ?)";
+        $searchTerm = "%{$filters['search']}%";
+        $params[] = $searchTerm;
+        $params[] = $searchTerm;
+        $params[] = $searchTerm;
+    }
+    
+    if (!empty($filters['location'])) {
+        $whereClause .= " AND i.location = ?";
+        $params[] = $filters['location'];
+    }
+    
+    if (!empty($filters['client'])) {
+        $whereClause .= " AND i.client = ?";
+        $params[] = $filters['client'];
+    }
+    
+    if (!empty($filters['stock_level'])) {
+        switch ($filters['stock_level']) {
+            case 'zero':
+                $whereClause .= " AND i.quantity = 0";
+                break;
+            case 'low':
+                $whereClause .= " AND i.quantity > 0 AND i.quantity <= COALESCE(sm.min_stock_level, 10)";
+                break;
+            case 'normal':
+                $whereClause .= " AND i.quantity > COALESCE(sm.min_stock_level, 10)";
+                break;
         }
     }
+    
+    $data = $db->fetchAll(
+        "SELECT i.sku, sm.description, i.quantity, i.location, i.client,
+                sm.unit_cost, sm.min_stock_level, sm.max_stock_level,
+                (i.quantity * COALESCE(sm.unit_cost, 0)) as total_value,
+                i.created_at, i.updated_at
+         FROM inventory i 
+         LEFT JOIN sku_master sm ON i.sku = sm.sku 
+         WHERE {$whereClause}
+         ORDER BY i.sku ASC",
+        $params
+    );
+    
+    $security->logActivity('INVENTORY_EXPORTED', [
+        'format' => $format,
+        'record_count' => count($data),
+        'filters' => $filters
+    ]);
+    
+    if ($format === 'json') {
+        return $data;
+    }
+    
+    // CSV format
+    if (empty($data)) {
+        return "No data available for export\n";
+    }
+    
+    $headers = ['SKU', 'Description', 'Quantity', 'Location', 'Client', 'Unit Cost', 'Min Stock', 'Max Stock', 'Total Value', 'Created At', 'Updated At'];
+    $csv = implode(',', $headers) . "\n";
+    
+    foreach ($data as $row) {
+        $csvRow = [
+            $row['sku'],
+            '"' . str_replace('"', '""', $row['description'] ?? '') . '"',
+            $row['quantity'],
+            $row['location'] ?? '',
+            $row['client'] ?? '',
+            $row['unit_cost'] ?? '0',
+            $row['min_stock_level'] ?? '',
+            $row['max_stock_level'] ?? '',
+            $row['total_value'] ?? '0',
+            $row['created_at'],
+            $row['updated_at']
+        ];
+        $csv .= implode(',', $csvRow) . "\n";
+    }
+    
+    return $csv;
 }
 
-// Build the final SQL query
-$base_sql = "SELECT * FROM inventory WHERE qty_on_hand > 0";
-if (!empty($where_conditions)) {
-    $base_sql .= " AND " . implode(" AND ", $where_conditions);
+/**
+ * Handle bulk actions
+ */
+function handleBulkAction($db, $security, $action, $selectedItems) {
+    if (!$security->hasRole($_SESSION['role'], 'supervisor')) {
+        return ['error' => 'Insufficient permissions for bulk actions'];
+    }
+    
+    $processedCount = 0;
+    $errors = [];
+    
+    foreach ($selectedItems as $itemId) {
+        $itemId = (int) $itemId;
+        if ($itemId <= 0) continue;
+        
+        try {
+            switch ($action) {
+                case 'delete':
+                    $affected = $db->softDelete('inventory', $itemId);
+                    if ($affected > 0) {
+                        $processedCount++;
+                        $security->logActivity('INVENTORY_BULK_DELETE', ['item_id' => $itemId]);
+                    }
+                    break;
+                    
+                case 'cycle_count':
+                    // Mark for cycle count (add to cycle count queue)
+                    $db->execute(
+                        "INSERT INTO cycle_count_queue (inventory_id, requested_by, requested_at) 
+                         VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE requested_at = NOW()",
+                        [$itemId, $_SESSION['user_id']]
+                    );
+                    $processedCount++;
+                    $security->logActivity('INVENTORY_CYCLE_COUNT_REQUESTED', ['item_id' => $itemId]);
+                    break;
+                    
+                default:
+                    $errors[] = "Unknown action: {$action}";
+            }
+        } catch (Exception $e) {
+            $errors[] = "Failed to process item {$itemId}: " . $e->getMessage();
+        }
+    }
+    
+    if ($processedCount > 0) {
+        return [
+            'success' => true,
+            'message' => "Successfully processed {$processedCount} items",
+            'errors' => $errors
+        ];
+    } else {
+        return ['error' => 'No items were processed. ' . implode(', ', $errors)];
+    }
 }
-
-// Get total count for pagination
-$count_sql = "SELECT COUNT(*) as total FROM inventory WHERE qty_on_hand > 0";
-if (!empty($where_conditions)) {
-    $count_sql .= " AND " . implode(" AND ", $where_conditions);
-}
-
-try {
-    $total_count = secure_select_one($conn, $count_sql, $bind_types, $bind_params);
-    $total_rows = $total_count['total'] ?? 0;
-    $total_pages = ceil($total_rows / $limit);
-} catch (Exception $e) {
-    $total_rows = 0;
-    $total_pages = 1;
-    error_log("Inventory count query failed: " . $e->getMessage());
-}
-
-// Get inventory data
-$data_sql = $base_sql . " ORDER BY sku_id ASC LIMIT ? OFFSET ?";
-$data_bind_types = $bind_types . 'ii';
-$data_bind_params = array_merge($bind_params, [$limit, $offset]);
-
-try {
-    $inventory_data = secure_select_all($conn, $data_sql, $data_bind_types, $data_bind_params);
-} catch (Exception $e) {
-    $inventory_data = [];
-    error_log("Inventory data query failed: " . $e->getMessage());
-}
-
-// Log user activity
-WMSSecurity::logActivity($conn, $_SESSION['user'], 'viewed_inventory',
-    "Page: {$page}, Limit: {$limit}, Filters: " . count($where_conditions));
 ?>
 
 <!DOCTYPE html>
@@ -190,539 +400,652 @@ WMSSecurity::logActivity($conn, $_SESSION['user'], 'viewed_inventory',
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Inventory Management | ECWMS</title>
-    <link rel="stylesheet" href="modern-style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Inventory Management - Secure WMS</title>
+    <meta name="robots" content="noindex, nofollow">
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta http-equiv="X-Frame-Options" content="SAMEORIGIN">
+    <meta http-equiv="X-XSS-Protection" content="1; mode=block">
+    
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    
     <style>
-        .inventory-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #34495e;
+            --success-color: #27ae60;
+            --warning-color: #f39c12;
+            --danger-color: #e74c3c;
+            --info-color: #3498db;
         }
-
-        .inventory-stats {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
+        
+        body {
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-
-        .inventory-stat {
+        
+        .navbar {
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            box-shadow: 0 2px 15px rgba(0,0,0,0.1);
+        }
+        
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+            transition: all 0.3s ease;
+        }
+        
+        .filters-card {
             background: white;
-            padding: 1rem 1.5rem;
-            border-radius: var(--border-radius);
-            box-shadow: var(--box-shadow);
-            text-align: center;
-            min-width: 120px;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
         }
-
-        .inventory-stat-value {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--primary-blue);
+        
+        .summary-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
         }
-
-        .inventory-stat-label {
-            font-size: 0.75rem;
-            color: var(--gray-600);
-            text-transform: uppercase;
-            letter-spacing: 0.025em;
-        }
-
-        .condition-badge {
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 500;
-            text-transform: uppercase;
-        }
-
-        .condition-ok1, .condition-ok2 { background: #dcfce7; color: #166534; }
-        .condition-dm1 { background: #fecaca; color: #991b1b; }
-        .condition-qc1 { background: #fed7aa; color: #9a3412; }
-        .condition-bl1 { background: #dbeafe; color: #1e40af; }
-        .condition-rt1 { background: #e9d5ff; color: #7c2d12; }
-
-        .table-controls {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin: 1rem 0;
-            flex-wrap: wrap;
-            gap: 1rem;
-        }
-
-        .pagination-info {
-            color: var(--gray-600);
-            font-size: 0.875rem;
-        }
-
-        .pagination-controls {
-            display: flex;
-            gap: 0.5rem;
-            align-items: center;
-        }
-
-        .table-wrapper {
-            background: white;
-            border-radius: var(--border-radius-lg);
-            box-shadow: var(--box-shadow);
+        
+        .table-responsive {
+            border-radius: 15px;
             overflow: hidden;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
         }
-
-        .table-scroll {
-            overflow-x: auto;
-            max-height: 70vh;
+        
+        .table {
+            background: white;
+            margin-bottom: 0;
         }
-
-        .inventory-table {
-            width: 100%;
-            min-width: 1800px;
-            border-collapse: collapse;
-            font-size: 0.875rem;
-        }
-
-        .inventory-table th {
-            background: var(--gray-50);
-            color: var(--gray-700);
+        
+        .table th {
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            border: none;
             font-weight: 600;
-            padding: 1rem 0.75rem;
-            text-align: left;
-            border-bottom: 1px solid var(--gray-200);
-            position: sticky;
-            top: 0;
-            z-index: 10;
-            white-space: nowrap;
+            color: var(--primary-color);
         }
-
-        .inventory-table td {
-            padding: 0.75rem;
-            border-bottom: 1px solid var(--gray-100);
+        
+        .table td {
+            border: none;
+            border-bottom: 1px solid #f1f3f4;
             vertical-align: middle;
         }
-
-        .inventory-table tbody tr:hover {
-            background-color: var(--gray-50);
+        
+        .stock-status {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 500;
         }
-
-        .inventory-table tbody tr.selected {
-            background-color: rgba(59, 130, 246, 0.1);
+        
+        .stock-normal { background: #d4edda; color: #155724; }
+        .stock-low { background: #fff3cd; color: #856404; }
+        .stock-zero { background: #f8d7da; color: #721c24; }
+        
+        .quantity-display {
+            font-weight: bold;
+            font-size: 1.1rem;
         }
-
-        .inventory-table tbody tr {
-            cursor: pointer;
+        
+        .location-badge {
+            background: #e3f2fd;
+            color: #1565c0;
+            padding: 4px 8px;
+            border-radius: 8px;
+            font-size: 0.8rem;
         }
-
-        .action-toolbar {
-            background: white;
-            padding: 1rem;
-            border-top: 1px solid var(--gray-200);
+        
+        .action-buttons {
             display: flex;
-            gap: 0.75rem;
-            justify-content: center;
+            gap: 5px;
+        }
+        
+        .bulk-actions {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            display: none;
+        }
+        
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        
+        .export-dropdown {
+            position: relative;
+        }
+        
+        .summary-stat {
+            text-align: center;
+            padding: 15px;
+        }
+        
+        .summary-stat h3 {
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        .summary-stat p {
+            margin-bottom: 0;
+            opacity: 0.9;
         }
     </style>
 </head>
-<body class="wms-layout">
-    <!-- Header -->
-    <header class="wms-header">
-        <div class="wms-logo">
-            <span>📦</span>
-            <span>ECWMS</span>
-        </div>
-        <div class="wms-search">
-            <input type="text" placeholder="Search inventory..." id="quickSearch">
-        </div>
-        <div class="wms-user-menu">
-            <span>👤 <?= secure_escape($_SESSION['user']) ?></span>
-            <a href="secure-dashboard.php" class="btn btn-secondary btn-sm">🏠 Dashboard</a>
-            <a href="logout.php" class="btn btn-danger btn-sm">🔒 Logout</a>
-        </div>
-    </header>
-
-    <!-- Main Content -->
-    <main class="wms-content">
-        <div class="fade-in">
-            <!-- Page Header -->
-            <div class="inventory-header">
-                <div>
-                    <h1>Inventory Management</h1>
-                    <p class="text-secondary">Manage stock levels, locations, and inventory movements</p>
-                </div>
-                <div class="d-flex gap-2">
-                    <a href="inventory_add.php" class="btn btn-primary">➕ Add Inventory</a>
-                    <a href="export_inventory_csv.php" class="btn btn-secondary">📤 Export</a>
-                </div>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="secure-dashboard.php">
+                <i class="fas fa-warehouse"></i> Inventory Management
+            </a>
+            
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="secure-dashboard.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+                <a class="nav-link" href="inbound_secure.php"><i class="fas fa-truck-loading"></i> Inbound</a>
+                <a class="nav-link" href="outbound_secure.php"><i class="fas fa-shipping-fast"></i> Outbound</a>
+                <a class="nav-link" href="auth.php?action=logout"><i class="fas fa-sign-out-alt"></i> Logout</a>
             </div>
+        </div>
+    </nav>
 
-            <!-- Statistics -->
-            <div class="inventory-stats">
-                <div class="inventory-stat">
-                    <div class="inventory-stat-value"><?= number_format($total_rows) ?></div>
-                    <div class="inventory-stat-label">Total Items</div>
-                </div>
-                <div class="inventory-stat">
-                    <div class="inventory-stat-value"><?= number_format(array_sum(array_column($inventory_data, 'qty_on_hand'))) ?></div>
-                    <div class="inventory-stat-label">Total Qty</div>
-                </div>
-                <div class="inventory-stat">
-                    <div class="inventory-stat-value"><?= number_format(array_sum(array_column($inventory_data, 'qty_allocated'))) ?></div>
-                    <div class="inventory-stat-label">Allocated</div>
-                </div>
-                <div class="inventory-stat">
-                    <div class="inventory-stat-value"><?= count(array_unique(array_column($inventory_data, 'location_id'))) ?></div>
-                    <div class="inventory-stat-label">Locations</div>
-                </div>
-            </div>
-
-            <!-- Filters -->
-            <div class="filter-panel">
-                <form method="GET" id="filterForm">
-                    <?= csrf_field() ?>
-
-                    <!-- Basic Filters -->
-                    <div class="filter-grid">
-                        <div class="form-group">
-                            <label class="form-label">Tag ID</label>
-                            <input type="text" name="tag_id" class="form-control" value="<?= secure_escape($_GET['tag_id'] ?? '') ?>">
+    <div class="container-fluid mt-4">
+        <!-- Summary Statistics -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="summary-card">
+                    <div class="row">
+                        <div class="col-md-3">
+                            <div class="summary-stat">
+                                <h3><?= number_format($summary['total_items']) ?></h3>
+                                <p><i class="fas fa-boxes"></i> Total Items</p>
+                            </div>
                         </div>
-                        <div class="form-group">
-                            <label class="form-label">SKU ID</label>
-                            <input type="text" name="sku_id" class="form-control" value="<?= secure_escape($_GET['sku_id'] ?? '') ?>">
+                        <div class="col-md-3">
+                            <div class="summary-stat">
+                                <h3><?= number_format($summary['total_quantity']) ?></h3>
+                                <p><i class="fas fa-cubes"></i> Total Quantity</p>
+                            </div>
                         </div>
-                        <div class="form-group">
-                            <label class="form-label">Location ID</label>
-                            <input type="text" name="location_id" class="form-control" value="<?= secure_escape($_GET['location_id'] ?? '') ?>">
+                        <div class="col-md-3">
+                            <div class="summary-stat">
+                                <h3><?= number_format($summary['low_stock_count']) ?></h3>
+                                <p><i class="fas fa-exclamation-triangle"></i> Low Stock Items</p>
+                            </div>
                         </div>
-                        <div class="form-group">
-                            <label class="form-label">Client ID</label>
-                            <input type="number" name="client_id" class="form-control" value="<?= secure_escape($_GET['client_id'] ?? '') ?>">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Description</label>
-                            <input type="text" name="description" class="form-control" value="<?= secure_escape($_GET['description'] ?? '') ?>">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Condition</label>
-                            <select name="condition" class="form-control form-select">
-                                <option value="">All Conditions</option>
-                                <option value="OK1" <?= ($_GET['condition'] ?? '') === 'OK1' ? 'selected' : '' ?>>OK1</option>
-                                <option value="OK2" <?= ($_GET['condition'] ?? '') === 'OK2' ? 'selected' : '' ?>>OK2</option>
-                                <option value="DM1" <?= ($_GET['condition'] ?? '') === 'DM1' ? 'selected' : '' ?>>DM1</option>
-                                <option value="QC1" <?= ($_GET['condition'] ?? '') === 'QC1' ? 'selected' : '' ?>>QC1</option>
-                                <option value="BL1" <?= ($_GET['condition'] ?? '') === 'BL1' ? 'selected' : '' ?>>BL1</option>
-                                <option value="RT1" <?= ($_GET['condition'] ?? '') === 'RT1' ? 'selected' : '' ?>>RT1</option>
-                            </select>
+                        <div class="col-md-3">
+                            <div class="summary-stat">
+                                <h3>$<?= number_format($summary['total_value'], 2) ?></h3>
+                                <p><i class="fas fa-dollar-sign"></i> Total Value</p>
+                            </div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
 
-                    <!-- Advanced Filters -->
-                    <details style="margin-top: 1rem;">
-                        <summary style="font-weight: 500; cursor: pointer; margin-bottom: 1rem;">Advanced Filters</summary>
-                        <div class="filter-grid">
-                            <div class="form-group">
-                                <label class="form-label">Zone</label>
-                                <input type="text" name="zone" class="form-control" value="<?= secure_escape($_GET['zone'] ?? '') ?>">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Batch ID</label>
-                                <input type="text" name="batch_id" class="form-control" value="<?= secure_escape($_GET['batch_id'] ?? '') ?>">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Receipt Date Filter</label>
-                                <select name="receipt_dstamp_filter" class="form-control form-select">
-                                    <option value="between">Between</option>
-                                    <option value="before">Before</option>
-                                    <option value="after">After</option>
-                                    <option value="exclude">Exclude</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">From Date</label>
-                                <input type="date" name="receipt_dstamp_from" class="form-control" value="<?= secure_escape($_GET['receipt_dstamp_from'] ?? '') ?>">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">To Date</label>
-                                <input type="date" name="receipt_dstamp_to" class="form-control" value="<?= secure_escape($_GET['receipt_dstamp_to'] ?? '') ?>">
-                            </div>
-                        </div>
-                    </details>
-
-                    <div class="filter-actions">
-                        <button type="submit" class="btn btn-primary">🔍 Apply Filters</button>
-                        <a href="secure-inventory.php" class="btn btn-secondary">🔄 Reset</a>
-                        <button type="button" class="btn btn-secondary" onclick="toggleAdvancedFilters()">⚙️ Advanced</button>
+        <!-- Filters -->
+        <div class="filters-card">
+            <form id="filtersForm" onsubmit="return false;">
+                <div class="row g-3">
+                    <div class="col-md-3">
+                        <label for="search" class="form-label">Search</label>
+                        <input type="text" class="form-control" id="search" name="search" 
+                               value="<?= $security->escapeOutput($filters['search']) ?>" 
+                               placeholder="SKU, description, or location...">
                     </div>
-                </form>
-            </div>
-
-            <!-- Table Controls -->
-            <div class="table-controls">
-                <div class="pagination-info">
-                    Showing <?= number_format(($page - 1) * $limit + 1) ?> to <?= number_format(min($page * $limit, $total_rows)) ?> of <?= number_format($total_rows) ?> items
-                </div>
-                <div class="pagination-controls">
-                    <form method="GET" style="display: inline-flex; align-items: center; gap: 0.5rem;">
-                        <?php foreach ($_GET as $key => $value): ?>
-                            <?php if ($key !== 'limit' && $key !== 'page'): ?>
-                                <input type="hidden" name="<?= secure_escape($key) ?>" value="<?= secure_escape($value) ?>">
-                            <?php endif; ?>
-                        <?php endforeach; ?>
-                        <label>Show:</label>
-                        <select name="limit" onchange="this.form.submit()" class="form-control" style="width: auto;">
-                            <option value="25" <?= $limit == 25 ? 'selected' : '' ?>>25</option>
-                            <option value="50" <?= $limit == 50 ? 'selected' : '' ?>>50</option>
-                            <option value="100" <?= $limit == 100 ? 'selected' : '' ?>>100</option>
-                            <option value="250" <?= $limit == 250 ? 'selected' : '' ?>>250</option>
-                        </select>
-                    </form>
-                </div>
-            </div>
-
-            <!-- Data Table -->
-            <?php if (!empty($inventory_data)): ?>
-            <div class="table-wrapper">
-                <div class="table-scroll">
-                    <table class="inventory-table">
-                        <thead>
-                            <tr>
-                                <th>Tag ID</th>
-                                <th>Client ID</th>
-                                <th>SKU ID</th>
-                                <th>Site ID</th>
-                                <th>Location ID</th>
-                                <th>Description</th>
-                                <th>Qty On Hand</th>
-                                <th>Qty Allocated</th>
-                                <th>Batch ID</th>
-                                <th>Condition</th>
-                                <th>Lock Status</th>
-                                <th>Zone</th>
-                                <th>Pallet Config</th>
-                                <th>Receipt ID</th>
-                                <th>Line ID</th>
-                                <th>Receipt Date</th>
-                                <th>Receipt Time</th>
-                                <th>Move Date</th>
-                                <th>Move Time</th>
-                                <th>Count Date</th>
-                                <th>Expiry Date</th>
-                                <th>Pallet ID</th>
-                                <th>Container ID</th>
-                                <th>Last Updated</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($inventory_data as $row): ?>
-                            <tr class="inventory-row" data-id="<?= secure_escape($row['tag_id']) ?>">
-                                <td><?= secure_escape($row['tag_id']) ?></td>
-                                <td><?= secure_escape($row['client_id']) ?></td>
-                                <td><strong><?= secure_escape($row['sku_id']) ?></strong></td>
-                                <td><?= secure_escape($row['site_id']) ?></td>
-                                <td><?= secure_escape($row['location_id']) ?></td>
-                                <td><?= secure_escape($row['description']) ?></td>
-                                <td><strong><?= number_format($row['qty_on_hand']) ?></strong></td>
-                                <td><?= number_format($row['qty_allocated']) ?></td>
-                                <td><?= secure_escape($row['batch_id']) ?></td>
-                                <td>
-                                    <?php if ($row['condition']): ?>
-                                        <span class="condition-badge condition-<?= strtolower($row['condition']) ?>">
-                                            <?= secure_escape($row['condition']) ?>
-                                        </span>
-                                    <?php endif; ?>
-                                </td>
-                                <td><?= secure_escape($row['lock_status']) ?></td>
-                                <td><?= secure_escape($row['zone']) ?></td>
-                                <td><?= secure_escape($row['pallet_config']) ?></td>
-                                <td><?= secure_escape($row['receipt_id']) ?></td>
-                                <td><?= secure_escape($row['line_id']) ?></td>
-                                <td><?= $row['receipt_dstamp'] ? date('M d, Y', strtotime($row['receipt_dstamp'])) : '' ?></td>
-                                <td><?= secure_escape($row['receipt_time']) ?></td>
-                                <td><?= $row['move_dstamp'] ? date('M d, Y', strtotime($row['move_dstamp'])) : '' ?></td>
-                                <td><?= secure_escape($row['move_time']) ?></td>
-                                <td><?= $row['count_dstamp'] ? date('M d, Y', strtotime($row['count_dstamp'])) : '' ?></td>
-                                <td><?= $row['expiry_date'] ? date('M d, Y', strtotime($row['expiry_date'])) : '' ?></td>
-                                <td><?= secure_escape($row['pallet_id']) ?></td>
-                                <td><?= secure_escape($row['container_id']) ?></td>
-                                <td><?= date('M d, Y H:i', strtotime($row['last_updated'])) ?></td>
-                            </tr>
+                    
+                    <div class="col-md-2">
+                        <label for="location" class="form-label">Location</label>
+                        <select class="form-select" id="location" name="location">
+                            <option value="">All Locations</option>
+                            <?php foreach ($locations as $loc): ?>
+                                <option value="<?= $security->escapeOutput($loc['location']) ?>" 
+                                        <?= $filters['location'] === $loc['location'] ? 'selected' : '' ?>>
+                                    <?= $security->escapeOutput($loc['location']) ?>
+                                </option>
                             <?php endforeach; ?>
-                        </tbody>
-                    </table>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-2">
+                        <label for="client" class="form-label">Client</label>
+                        <select class="form-select" id="client" name="client">
+                            <option value="">All Clients</option>
+                            <?php foreach ($clients as $client): ?>
+                                <option value="<?= $security->escapeOutput($client['client']) ?>" 
+                                        <?= $filters['client'] === $client['client'] ? 'selected' : '' ?>>
+                                    <?= $security->escapeOutput($client['client']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-2">
+                        <label for="stock_level" class="form-label">Stock Level</label>
+                        <select class="form-select" id="stock_level" name="stock_level">
+                            <option value="">All Levels</option>
+                            <option value="zero" <?= $filters['stock_level'] === 'zero' ? 'selected' : '' ?>>Zero Stock</option>
+                            <option value="low" <?= $filters['stock_level'] === 'low' ? 'selected' : '' ?>>Low Stock</option>
+                            <option value="normal" <?= $filters['stock_level'] === 'normal' ? 'selected' : '' ?>>Normal Stock</option>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-3 d-flex align-items-end">
+                        <button type="button" class="btn btn-primary me-2" onclick="applyFilters()">
+                            <i class="fas fa-search"></i> Filter
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary me-2" onclick="clearFilters()">
+                            <i class="fas fa-times"></i> Clear
+                        </button>
+                        <div class="dropdown">
+                            <button class="btn btn-success dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                                <i class="fas fa-download"></i> Export
+                            </button>
+                            <ul class="dropdown-menu">
+                                <li><a class="dropdown-item" href="#" onclick="exportData('csv')">
+                                    <i class="fas fa-file-csv"></i> CSV
+                                </a></li>
+                                <li><a class="dropdown-item" href="#" onclick="exportData('json')">
+                                    <i class="fas fa-file-code"></i> JSON
+                                </a></li>
+                            </ul>
+                        </div>
+                    </div>
                 </div>
+            </form>
+        </div>
 
-                <!-- Action Toolbar -->
-                <div class="action-toolbar">
-                    <button id="editBtn" class="btn btn-primary" disabled onclick="editSelected()">✏️ Edit Selected</button>
-                    <button id="deleteBtn" class="btn btn-danger" disabled onclick="deleteSelected()">🗑️ Delete Selected</button>
-                    <button class="btn btn-secondary" onclick="clearSelection()">Clear Selection</button>
+        <!-- Bulk Actions -->
+        <div class="bulk-actions" id="bulkActions">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <span id="selectedCount">0</span> items selected
                 </div>
-            </div>
-
-            <!-- Pagination -->
-            <?php if ($total_pages > 1): ?>
-            <div class="pagination-controls" style="justify-content: center; margin-top: 2rem;">
-                <?php if ($page > 1): ?>
-                    <a href="?<?= http_build_query(array_merge($_GET, ['page' => $page - 1])) ?>" class="btn btn-secondary">« Previous</a>
-                <?php endif; ?>
-
-                <?php
-                $start = max(1, $page - 2);
-                $end = min($total_pages, $page + 2);
-                ?>
-
-                <?php for ($i = $start; $i <= $end; $i++): ?>
-                    <?php if ($i == $page): ?>
-                        <button class="btn btn-primary"><?= $i ?></button>
-                    <?php else: ?>
-                        <a href="?<?= http_build_query(array_merge($_GET, ['page' => $i])) ?>" class="btn btn-secondary"><?= $i ?></a>
+                <div>
+                    <?php if ($security->hasRole($_SESSION['role'], 'supervisor')): ?>
+                        <button class="btn btn-sm btn-warning me-2" onclick="bulkAction('cycle_count')">
+                            <i class="fas fa-clipboard-check"></i> Request Cycle Count
+                        </button>
+                        <button class="btn btn-sm btn-danger" onclick="bulkAction('delete')">
+                            <i class="fas fa-trash"></i> Delete Selected
+                        </button>
                     <?php endif; ?>
-                <?php endfor; ?>
-
-                <?php if ($page < $total_pages): ?>
-                    <a href="?<?= http_build_query(array_merge($_GET, ['page' => $page + 1])) ?>" class="btn btn-secondary">Next »</a>
-                <?php endif; ?>
-            </div>
-            <?php endif; ?>
-
-            <?php else: ?>
-            <div class="card">
-                <div class="card-body text-center">
-                    <h3>No inventory records found</h3>
-                    <p class="text-secondary">Try adjusting your filters or add some inventory items.</p>
-                    <a href="inventory_add.php" class="btn btn-primary">➕ Add Inventory</a>
+                    <button class="btn btn-sm btn-secondary ms-2" onclick="clearSelection()">
+                        <i class="fas fa-times"></i> Clear
+                    </button>
                 </div>
             </div>
+        </div>
+
+        <!-- Inventory Table -->
+        <div class="card">
+            <div class="card-header">
+                <div class="d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="fas fa-list"></i> Inventory Items (<?= $pagination['total'] ?>)</h5>
+                    <div>
+                        <button class="btn btn-sm btn-outline-primary" onclick="refreshData()">
+                            <i class="fas fa-sync-alt"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="inventoryTableContainer">
+                    <?php if (empty($inventory)): ?>
+                        <div class="text-center py-5">
+                            <i class="fas fa-box-open fa-3x text-muted mb-3"></i>
+                            <p class="text-muted">No inventory items found</p>
+                        </div>
+                    <?php else: ?>
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <?php if ($security->hasRole($_SESSION['role'], 'supervisor')): ?>
+                                            <th width="50">
+                                                <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+                                            </th>
+                                        <?php endif; ?>
+                                        <th>SKU</th>
+                                        <th>Description</th>
+                                        <th>Quantity</th>
+                                        <th>Location</th>
+                                        <th>Client</th>
+                                        <th>Status</th>
+                                        <th>Last Updated</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($inventory as $item): ?>
+                                        <tr>
+                                            <?php if ($security->hasRole($_SESSION['role'], 'supervisor')): ?>
+                                                <td>
+                                                    <input type="checkbox" class="item-checkbox" value="<?= $item['id'] ?>" 
+                                                           onchange="updateSelection()">
+                                                </td>
+                                            <?php endif; ?>
+                                            <td>
+                                                <strong><?= $security->escapeOutput($item['sku']) ?></strong>
+                                            </td>
+                                            <td>
+                                                <?= $security->escapeOutput($item['description'] ?? 'No description') ?>
+                                                <?php if ($item['unit_cost']): ?>
+                                                    <br><small class="text-muted">Unit: $<?= number_format($item['unit_cost'], 2) ?></small>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <span class="quantity-display text-<?= getQuantityColor($item['stock_status']) ?>">
+                                                    <?= number_format($item['quantity']) ?>
+                                                </span>
+                                                <?php if ($item['min_stock_level']): ?>
+                                                    <br><small class="text-muted">Min: <?= $item['min_stock_level'] ?></small>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <?php if ($item['location']): ?>
+                                                    <span class="location-badge"><?= $security->escapeOutput($item['location']) ?></span>
+                                                <?php else: ?>
+                                                    <span class="text-muted">No location</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td><?= $security->escapeOutput($item['client'] ?? 'No client') ?></td>
+                                            <td>
+                                                <span class="stock-status stock-<?= $item['stock_status'] ?>">
+                                                    <?= ucfirst($item['stock_status']) ?> Stock
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <small><?= date('M j, Y H:i', strtotime($item['updated_at'])) ?></small>
+                                            </td>
+                                            <td>
+                                                <div class="action-buttons">
+                                                    <a href="edit_sku_secure.php?id=<?= $item['id'] ?>" 
+                                                       class="btn btn-sm btn-outline-primary" title="Edit">
+                                                        <i class="fas fa-edit"></i>
+                                                    </a>
+                                                    <a href="fetch_sku_info_secure.php?sku=<?= urlencode($item['sku']) ?>" 
+                                                       class="btn btn-sm btn-outline-info" title="View Details">
+                                                        <i class="fas fa-eye"></i>
+                                                    </a>
+                                                    <?php if ($security->hasRole($_SESSION['role'], 'supervisor')): ?>
+                                                        <button class="btn btn-sm btn-outline-danger" 
+                                                                onclick="deleteInventoryItem(<?= $item['id'] ?>, '<?= $security->escapeOutput($item['sku']) ?>')" 
+                                                                title="Delete">
+                                                            <i class="fas fa-trash"></i>
+                                                        </button>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <!-- Pagination -->
+            <?php if ($pagination['total_pages'] > 1): ?>
+                <div class="card-footer">
+                    <nav aria-label="Inventory pagination">
+                        <ul class="pagination justify-content-center mb-0">
+                            <?php if ($pagination['has_prev']): ?>
+                                <li class="page-item">
+                                    <a class="page-link" href="#" onclick="goToPage(<?= $pagination['current_page'] - 1 ?>)">
+                                        <i class="fas fa-chevron-left"></i>
+                                    </a>
+                                </li>
+                            <?php endif; ?>
+                            
+                            <?php for ($i = max(1, $pagination['current_page'] - 2); $i <= min($pagination['total_pages'], $pagination['current_page'] + 2); $i++): ?>
+                                <li class="page-item <?= $i === $pagination['current_page'] ? 'active' : '' ?>">
+                                    <a class="page-link" href="#" onclick="goToPage(<?= $i ?>)"><?= $i ?></a>
+                                </li>
+                            <?php endfor; ?>
+                            
+                            <?php if ($pagination['has_next']): ?>
+                                <li class="page-item">
+                                    <a class="page-link" href="#" onclick="goToPage(<?= $pagination['current_page'] + 1 ?>)">
+                                        <i class="fas fa-chevron-right"></i>
+                                    </a>
+                                </li>
+                            <?php endif; ?>
+                        </ul>
+                    </nav>
+                </div>
             <?php endif; ?>
         </div>
-    </main>
+    </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        let selectedRows = new Set();
-
-        // Row selection handling
-        document.querySelectorAll('.inventory-row').forEach(row => {
-            row.addEventListener('click', function(e) {
-                if (e.ctrlKey || e.metaKey) {
-                    // Multi-select with Ctrl/Cmd
-                    this.classList.toggle('selected');
-                    const tagId = this.dataset.id;
-                    if (selectedRows.has(tagId)) {
-                        selectedRows.delete(tagId);
-                    } else {
-                        selectedRows.add(tagId);
-                    }
+        const csrfToken = '<?= $csrfToken ?>';
+        let selectedItems = [];
+        
+        function applyFilters() {
+            const form = document.getElementById('filtersForm');
+            const formData = new FormData(form);
+            const params = new URLSearchParams(formData);
+            
+            // Update URL without reloading
+            window.history.pushState({}, '', '?' + params.toString());
+            
+            // Load filtered data
+            loadInventoryData();
+        }
+        
+        function clearFilters() {
+            document.getElementById('filtersForm').reset();
+            window.history.pushState({}, '', window.location.pathname);
+            loadInventoryData();
+        }
+        
+        function loadInventoryData(page = 1) {
+            const container = document.getElementById('inventoryTableContainer');
+            container.classList.add('loading');
+            
+            const form = document.getElementById('filtersForm');
+            const formData = new FormData(form);
+            formData.append('action', 'get_inventory_data');
+            formData.append('csrf_token', csrfToken);
+            formData.append('page', page);
+            
+            fetch(window.location.href, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    updateInventoryDisplay(data.data);
                 } else {
-                    // Single select
-                    document.querySelectorAll('.inventory-row').forEach(r => r.classList.remove('selected'));
-                    selectedRows.clear();
-                    this.classList.add('selected');
-                    selectedRows.add(this.dataset.id);
+                    alert('Failed to load inventory data: ' + data.error);
                 }
-                updateActionButtons();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Failed to load inventory data');
+            })
+            .finally(() => {
+                container.classList.remove('loading');
             });
-        });
-
-        function updateActionButtons() {
-            const editBtn = document.getElementById('editBtn');
-            const deleteBtn = document.getElementById('deleteBtn');
-            const hasSelection = selectedRows.size > 0;
-
-            editBtn.disabled = selectedRows.size !== 1;
-            deleteBtn.disabled = !hasSelection;
         }
-
-        function editSelected() {
-            if (selectedRows.size === 1) {
-                const tagId = Array.from(selectedRows)[0];
-                window.location.href = `inventory_edit.php?tag_id=${encodeURIComponent(tagId)}`;
-            }
+        
+        function updateInventoryDisplay(data) {
+            // Update table content
+            // Implementation would update the table with new data
+            location.reload(); // Simplified for this example
         }
-
-        function deleteSelected() {
-            if (selectedRows.size > 0) {
-                const count = selectedRows.size;
-                if (confirm(`Are you sure you want to delete ${count} inventory item(s)?`)) {
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = 'inventory_delete.php';
-
-                    // Add CSRF token
-                    const csrfInput = document.createElement('input');
-                    csrfInput.type = 'hidden';
-                    csrfInput.name = 'csrf_token';
-                    csrfInput.value = '<?= csrf_token() ?>';
-                    form.appendChild(csrfInput);
-
-                    // Add selected IDs
-                    selectedRows.forEach(tagId => {
-                        const input = document.createElement('input');
-                        input.type = 'hidden';
-                        input.name = 'tag_ids[]';
-                        input.value = tagId;
-                        form.appendChild(input);
-                    });
-
-                    document.body.appendChild(form);
-                    form.submit();
+        
+        function goToPage(page) {
+            loadInventoryData(page);
+        }
+        
+        function refreshData() {
+            loadInventoryData();
+        }
+        
+        function exportData(format) {
+            const form = document.getElementById('filtersForm');
+            const formData = new FormData(form);
+            formData.append('action', 'export_inventory');
+            formData.append('csrf_token', csrfToken);
+            formData.append('format', format);
+            
+            fetch(window.location.href, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    downloadFile(data.data, `inventory_export.${format}`, format);
+                } else {
+                    alert('Export failed: ' + data.error);
                 }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Export failed');
+            });
+        }
+        
+        function downloadFile(data, filename, format) {
+            let content, mimeType;
+            
+            if (format === 'json') {
+                content = JSON.stringify(data, null, 2);
+                mimeType = 'application/json';
+            } else {
+                content = data;
+                mimeType = 'text/csv';
+            }
+            
+            const blob = new Blob([content], { type: mimeType });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.click();
+            window.URL.revokeObjectURL(url);
+        }
+        
+        function toggleSelectAll() {
+            const selectAll = document.getElementById('selectAll');
+            const checkboxes = document.querySelectorAll('.item-checkbox');
+            
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = selectAll.checked;
+            });
+            
+            updateSelection();
+        }
+        
+        function updateSelection() {
+            const checkboxes = document.querySelectorAll('.item-checkbox:checked');
+            selectedItems = Array.from(checkboxes).map(cb => cb.value);
+            
+            const bulkActions = document.getElementById('bulkActions');
+            const selectedCount = document.getElementById('selectedCount');
+            
+            selectedCount.textContent = selectedItems.length;
+            
+            if (selectedItems.length > 0) {
+                bulkActions.style.display = 'block';
+            } else {
+                bulkActions.style.display = 'none';
             }
         }
-
+        
         function clearSelection() {
-            document.querySelectorAll('.inventory-row').forEach(r => r.classList.remove('selected'));
-            selectedRows.clear();
-            updateActionButtons();
+            document.querySelectorAll('.item-checkbox').forEach(cb => cb.checked = false);
+            document.getElementById('selectAll').checked = false;
+            updateSelection();
         }
-
-        // Quick search functionality
-        document.getElementById('quickSearch').addEventListener('keyup', function(e) {
-            if (e.key === 'Enter') {
-                const query = this.value;
-                if (query) {
-                    // Add search to description filter and submit
-                    const descInput = document.querySelector('input[name="description"]');
-                    descInput.value = query;
-                    document.getElementById('filterForm').submit();
-                }
+        
+        function bulkAction(action) {
+            if (selectedItems.length === 0) {
+                alert('No items selected');
+                return;
             }
-        });
-
-        // Auto-submit form on filter changes
-        document.querySelectorAll('select[name="condition"]').forEach(select => {
-            select.addEventListener('change', function() {
-                document.getElementById('filterForm').submit();
+            
+            let confirmMessage = '';
+            switch (action) {
+                case 'delete':
+                    confirmMessage = `Delete ${selectedItems.length} selected items?`;
+                    break;
+                case 'cycle_count':
+                    confirmMessage = `Request cycle count for ${selectedItems.length} selected items?`;
+                    break;
+                default:
+                    alert('Unknown action');
+                    return;
+            }
+            
+            if (!confirm(confirmMessage)) return;
+            
+            const formData = new FormData();
+            formData.append('action', 'bulk_action');
+            formData.append('csrf_token', csrfToken);
+            formData.append('bulk_action', action);
+            selectedItems.forEach(item => formData.append('selected_items[]', item));
+            
+            fetch(window.location.href, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(data.message);
+                    clearSelection();
+                    refreshData();
+                } else {
+                    alert('Bulk action failed: ' + data.error);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Bulk action failed');
             });
-        });
-
-        // Keyboard shortcuts
-        document.addEventListener('keydown', function(e) {
-            if (e.ctrlKey || e.metaKey) {
-                switch(e.key) {
-                    case 'a':
-                        e.preventDefault();
-                        // Select all visible rows
-                        document.querySelectorAll('.inventory-row').forEach(row => {
-                            row.classList.add('selected');
-                            selectedRows.add(row.dataset.id);
-                        });
-                        updateActionButtons();
-                        break;
-                    case 'Escape':
-                        clearSelection();
-                        break;
-                }
+        }
+        
+        function deleteInventoryItem(id, sku) {
+            if (confirm(`Delete inventory item "${sku}"?`)) {
+                window.location.href = `inventory_delete_secure.php?id=${id}`;
             }
-        });
-
+        }
+        
         // Auto-refresh every 5 minutes
-        setInterval(function() {
-            if (document.visibilityState === 'visible') {
-                window.location.reload();
-            }
-        }, 300000);
+        setInterval(refreshData, 300000);
+        
+        // Real-time search
+        let searchTimeout;
+        document.getElementById('search').addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(applyFilters, 500);
+        });
     </script>
 </body>
 </html>
 
-<?php $conn->close(); ?>
+<?php
+function getQuantityColor($stockStatus) {
+    return match($stockStatus) {
+        'zero' => 'danger',
+        'low' => 'warning',
+        'normal' => 'success',
+        default => 'secondary'
+    };
+}
+?>
