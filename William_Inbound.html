@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inbound Label Generator</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+  h1 { text-align: center; margin-bottom: 20px; }
+  label { display: block; margin: 10px 0 4px; font-weight: bold; }
+  input, button { padding: 10px; font-size: 16px; width: 100%; max-width: 400px; box-sizing: border-box; }
+  button { margin-top: 15px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
+  #labelPreview { margin-top: 30px; padding: 15px; background: white; border: 2px solid #333; max-width: 400px; }
+  #barcode { margin-top: 10px; }
+  #video { width: 100%; max-width: 400px; display: none; margin-top: 15px; }
+  #scanBtn { background-color: #28a745; }
+  #stopScanBtn { background-color: #dc3545; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<h1>WIPI Inbound Generator</h1>
+
+<label for="sku">SKU</label>
+<input type="text" id="sku" autocomplete="off" placeholder="Enter or scan SKU" />
+
+<label for="description">Description</label>
+<input type="text" id="description" autocomplete="off" placeholder="Enter Description" />
+
+<label for="quantity">Quantity</label>
+<input type="number" id="quantity" autocomplete="off" placeholder="Enter Quantity" min="1" />
+
+<button id="scanBtn">Scan SKU Barcode</button>
+<button id="printBtn">Print Label</button>
+<button id="stopScanBtn" style="display:none;">Stop Scanning</button>
+
+<video id="video" playsinline></video>
+
+<div id="labelPreview" style="display:none;">
+  <h2>InfiniSekai Co, LTD</h2>
+  <div><strong>SKU:</strong> <span id="previewSku"></span></div>
+  <div><strong>Description:</strong> <span id="previewDesc"></span></div>
+  <div><strong>Quantity:</strong> <span id="previewQty"></span></div>
+  <canvas id="barcode"></canvas>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+<script src="https://unpkg.com/@zxing/library@0.19.1/umd/index.min.js"></script>
+<script>
+  const skuInput = document.getElementById('sku');
+  const descInput = document.getElementById('description');
+  const qtyInput = document.getElementById('quantity');
+  const scanBtn = document.getElementById('scanBtn');
+  const printBtn = document.getElementById('printBtn');
+  const stopScanBtn = document.getElementById('stopScanBtn');
+  const video = document.getElementById('video');
+  const labelPreview = document.getElementById('labelPreview');
+  const previewSku = document.getElementById('previewSku');
+  const previewDesc = document.getElementById('previewDesc');
+  const previewQty = document.getElementById('previewQty');
+  const barcodeCanvas = document.getElementById('barcode');
+
+  let codeReader = null;
+  let scanning = false;
+
+  function updatePreview() {
+    const sku = skuInput.value.trim();
+    const desc = descInput.value.trim();
+    const qty = qtyInput.value.trim();
+
+    if (sku && desc && qty) {
+      previewSku.textContent = sku;
+      previewDesc.textContent = desc;
+      previewQty.textContent = qty;
+      labelPreview.style.display = 'block';
+      JsBarcode(barcodeCanvas, sku, { format: "code128", width: 2, height: 50, displayValue: true });
+    } else {
+      labelPreview.style.display = 'none';
+    }
+  }
+
+  skuInput.addEventListener('input', updatePreview);
+  descInput.addEventListener('input', updatePreview);
+  qtyInput.addEventListener('input', updatePreview);
+
+  scanBtn.addEventListener('click', async () => {
+    if (scanning) return;
+    scanning = true;
+    scanBtn.style.display = 'none';
+    stopScanBtn.style.display = 'inline-block';
+    video.style.display = 'block';
+
+    codeReader = new ZXing.BrowserBarcodeReader();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      video.srcObject = stream;
+      video.play();
+
+      const result = await codeReader.decodeOnceFromVideoElement(video);
+      skuInput.value = result.text;
+      updatePreview();
+
+      // Stop video stream
+      stream.getTracks().forEach(track => track.stop());
+      video.style.display = 'none';
+      scanBtn.style.display = 'inline-block';
+      stopScanBtn.style.display = 'none';
+      scanning = false;
+
+    } catch (err) {
+      alert('Scanning failed or was cancelled: ' + err);
+      stopScan();
+    }
+  });
+
+  stopScanBtn.addEventListener('click', () => {
+    stopScan();
+  });
+
+  function stopScan() {
+    if (!scanning) return;
+    scanning = false;
+    scanBtn.style.display = 'inline-block';
+    stopScanBtn.style.display = 'none';
+    video.style.display = 'none';
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(track => track.stop());
+    }
+  }
+
+  printBtn.addEventListener('click', () => {
+    if (!skuInput.value.trim() || !descInput.value.trim() || !qtyInput.value.trim()) {
+      alert('Please fill in SKU, Description, and Quantity before printing.');
+      return;
+    }
+    const printContent = `
+      <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #333; width: 300px;">
+        <h2>Inbound Label</h2>
+        <p><strong>SKU:</strong> ${skuInput.value.trim()}</p>
+        <p><strong>Description:</strong> ${descInput.value.trim()}</p>
+        <p><strong>Quantity:</strong> ${qtyInput.value.trim()}</p>
+        <svg id="barcode"></svg>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"><\/script>
+      <script>
+        JsBarcode("#barcode", "${skuInput.value.trim()}", {
+          format: "code128", width: 2, height: 50, displayValue: true
+        });
+      <\/script>
+    `;
+    const printWindow = window.open('', '_blank', 'width=400,height=600');
+    printWindow.document.write(printContent);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.onload = () => {
+      printWindow.print();
+      printWindow.close();
+    };
+  });
+</script>
+
+</body>
+</html>
